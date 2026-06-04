@@ -1,15 +1,19 @@
-import { Injectable, ConflictException, UnauthorizedException } from '@nestjs/common';
+import { Injectable, ConflictException, UnauthorizedException, Inject } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { EmployeeService } from '../employee/employee.service';
 import { SignUpDto } from './dto/signup.dto';
 import { SignInDto } from './dto/signin.dto';
 import * as bcrypt from 'bcrypt';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class AuthService {
   constructor(
     private readonly employeeService: EmployeeService,
     private readonly jwtService: JwtService,
+    @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
   ) {}
 
   async signUp(signUpDto: SignUpDto) {
@@ -40,11 +44,25 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const payload = { sub: employee.id };
+    const payload = { sub: employee.id, jti: randomUUID() };
     const access_token = await this.jwtService.signAsync(payload);
     
     return {
       access_token,
     };
+  }
+
+  async logout(token: string): Promise<void> {
+    try {
+      const decoded = this.jwtService.decode(token) as any;
+      if (decoded && decoded.jti && decoded.exp) {
+        const ttl = decoded.exp - Math.floor(Date.now() / 1000);
+        if (ttl > 0) {
+          await this.cacheManager.set(`blacklist:${decoded.jti}`, '1', ttl * 1000);
+        }
+      }
+    } catch (e) {
+      // Ignore
+    }
   }
 }

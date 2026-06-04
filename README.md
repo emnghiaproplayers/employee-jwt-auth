@@ -1,20 +1,22 @@
-# NestJS Employee JWT Authentication & Security API
+# NestJS Employee JWT Authentication & Redis Blacklisting
 
-Hệ thống quản lý thông tin nhân viên (Employee) kết hợp cơ chế đăng ký/đăng nhập và xác thực không trạng thái (stateless) bằng JSON Web Token (JWT) theo thuật toán mã hóa đối xứng HS256, sử dụng NestJS, Passport, TypeORM và PostgreSQL 16 chạy trong Docker.
+Hệ thống quản lý thông tin nhân viên (Employee) kết hợp cơ chế đăng ký/đăng nhập, xác thực không trạng thái (stateless) bằng JSON Web Token (JWT) theo thuật toán HS256 và cơ chế thu hồi phiên làm việc (revocation/logout) thời gian thực sử dụng Redis Blacklist. Dịch vụ chạy trên nền tảng NestJS, Passport, TypeORM, PostgreSQL 16 và Redis 7 thông qua Docker Compose.
 
 ---
 
 ## 1. Challenge Description
 
-Bài toán tập trung thiết lập quy trình xác thực người dùng an toàn và chuẩn hóa dữ liệu:
-- **Độc lập hóa Module**: Tách biệt `AuthModule` (xử lý signup/signin/strategy/guard) khỏi `EmployeeModule` (xử lý tài nguyên nghiệp vụ của nhân viên).
-- **PostgreSQL qua Docker**: Triển khai database qua Docker Compose với Postgres phiên bản 16.
-- **Tắt đồng bộ hóa Schema tự động (`synchronize: false`)**: Dùng TypeORM CLI để tạo và chạy database migrations nhằm duy trì và bảo vệ tính toàn vẹn của dữ liệu ở mọi môi trường.
-- **Mã hóa và chống Enumeration**:
-  - Mã hóa mật khẩu nhân viên bằng `bcrypt` với độ muối (salt rounds) là 10.
-  - Thu gọn và đồng nhất phản hồi lỗi đăng nhập 401 khi sai mật khẩu hoặc tài khoản không tồn tại để ngăn chặn nguy cơ rò rỉ dữ liệu người dùng (anti-user enumeration).
-  - Trả về token định dạng snake_case `access_token` chứa tối thiểu thông tin định danh (chỉ chứa `sub: user.id`).
-- **Bảo vệ Endpoint**: Sử dụng `JwtAuthGuard` và `JwtStrategy` kế thừa Passport để bảo vệ nghiêm ngặt đường dẫn protected `GET /employees/profile`.
+Bài toán tập trung xây dựng quy trình xác thực người dùng an sau và cơ chế thu hồi JWT linh hoạt:
+- **Độc lập hóa Module**: Tách biệt `AuthModule` (signup/signin/strategy/guard) khỏi `EmployeeModule` (tài nguyên nghiệp vụ).
+- **PostgreSQL & Redis qua Docker**: Dựng cơ sở dữ liệu Postgres 16 và Redis 7 Alpine qua Docker Compose.
+- **Tắt đồng bộ hóa Schema tự động (`synchronize: false`)**: Dùng TypeORM CLI để tạo và chạy database migrations.
+- **Mã hóa và chống Enumeration**: Mã hóa mật khẩu bằng `bcrypt` (10 salt rounds), đồng nhất phản hồi lỗi đăng nhập 401 để chống User Enumeration.
+- **Unique Token Identifier (jti claim)**: Thêm claim `jti` (UUID v4) vào mỗi JWT token lúc đăng nhập để làm định danh duy nhất phục vụ thu hồi token.
+- **Cơ chế thu hồi phiên làm việc (Logout)**:
+  - Cho phép người dùng logout, trích xuất token hiện tại và giải mã để lấy `jti` và `exp`.
+  - Tính TTL động: `ttl = exp - hiện tại`.
+  - Lưu cặp `blacklist:<jti>` vào Redis với TTL động để tự động giải phóng bộ nhớ khi token hết hạn tự nhiên.
+- **Can thiệp JwtStrategy**: Tích hợp kiểm tra blacklist trực tiếp trong `JwtStrategy` sau khi verify chữ ký thành công.
 
 ---
 
@@ -24,8 +26,8 @@ Bài toán tập trung thiết lập quy trình xác thực người dùng an to
 - Docker và Docker Compose cài đặt sẵn.
 - Node.js >= 18.x và npm.
 
-### B. Khởi chạy và Dựng dữ liệu
-1. **Khởi động database PostgreSQL 16 container**:
+### B. Khởi chạy ứng dụng
+1. **Khởi động database PostgreSQL 16 và Redis 7 Alpine**:
    ```bash
    docker compose up -d
    ```
@@ -54,232 +56,230 @@ Bài toán tập trung thiết lập quy trình xác thực người dùng an to
 
 Dự án được xây dựng dựa trên:
 - **NestJS v11.x**, **TypeScript v5.7**, **TypeORM**, **Postgres driver (`pg`)**.
-- **@nestjs/passport & passport-jwt**: Xử lý middleware xác thực.
-- **bcrypt**: Mã hóa một chiều mật khẩu.
+- **cache-manager-ioredis-yet & @nestjs/cache-manager**: Kết nối và quản trị bộ nhớ cache Redis.
+- **keyv**: Được NestJS CacheManager v3 sử dụng ngầm để định cấu hình lưu trữ phân tán.
 
-### Sơ đồ luồng hoạt động xác thực Profile (Mermaid Diagram)
+### Sơ đồ Mermaid luồng Revocation & Blacklisting
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client as Client / HTTP Request
-    participant Guard as JwtAuthGuard (jwt-auth.guard.ts)
-    participant Strategy as JwtStrategy (jwt.strategy.ts)
-    participant Controller as EmployeeController (employee.controller.ts)
-    participant DB as Postgres Database
+    participant Controller as AuthController (auth.controller.ts)
+    participant Service as AuthService (auth.service.ts)
+    participant Redis as Redis Cache Store
 
-    Client->>Guard: GET /employees/profile (Authorization: Bearer <token>)
-    activate Guard
-    Note over Guard: Kích hoạt canActivate()
-    Guard->>Strategy: Chuyển tiếp Token để giải mã
-    activate Strategy
-    Note over Strategy: Kiểm tra chữ ký HS256 & Expired
-    alt Token hợp lệ
-        Strategy->>Strategy: Gọi validate(payload)
-        Note over Strategy: Trả về { userId: payload.sub }
-        Strategy-->>Guard: Xác thực thành công
-        Guard->>Controller: Cho phép truy cập (req.user = { userId })
-        activate Controller
-        Controller-->>Client: Trả về 200 OK { message, user: { userId } }
-        deactivate Controller
-    else Token thiếu / Sai chữ ký / Hết hạn
-        Strategy-->>Guard: Lỗi xác thực
-        deactivate Strategy
-        Guard-->>Client: Trả về HTTP 401 Unauthorized
-        deactivate Guard
-    end
+    Note over Client, Redis: Phase 1: Đăng xuất & Thu hồi Token (SET)
+    Client->>Controller: POST /auth/logout (Authorization: Bearer <tokenA>)
+    activate Controller
+    Note over Controller: Xác thực JWT hợp lệ thành công qua Guard
+    Controller->>Service: logout(tokenA)
+    activate Service
+    Note over Service: Giải mã tokenA lấy jti & exp
+    Note over Service: Tính TTL = exp - hiện tại
+    Service->>Redis: SET blacklist:<jti> "1" EX <ttl>
+    activate Redis
+    Redis-->>Service: Đã lưu thành công
+    deactivate Redis
+    Service-->>Controller: Hoàn tất thu hồi
+    deactivate Service
+    Controller-->>Client: Trả về HTTP 204 No Content
+    deactivate Controller
+
+    Note over Client, Redis: Phase 2: Xác thực & Đối chiếu Blacklist (GET)
+    Client->>Controller: GET /employees/profile (Authorization: Bearer <tokenA>)
+    activate Controller
+    Note over Controller: Kích hoạt Guard -> JwtStrategy
+    Note over Controller: Giải mã chữ ký tokenA và lấy jti từ payload
+    Controller->>Redis: GET blacklist:<jti>
+    activate Redis
+    Redis-->>Controller: Trả về "1" (Token đã bị thu hồi)
+    deactivate Redis
+    Controller-->>Client: Trả về HTTP 401 Unauthorized (Token revoked)
+    deactivate Controller
 ```
 
 ---
 
 ## 4. Smoke Test (Bằng chứng Thực tế)
 
-Dưới đây là các phản hồi thực tế được thực hiện trực tiếp từ dòng lệnh sử dụng `curl.exe` gửi tới NestJS server:
+Dưới đây là các phản hồi thực tế được thực hiện trực tiếp từ dòng lệnh sử dụng `curl.exe` và `redis-cli` trong môi trường Docker:
 
-### Case 1: Đăng ký tài khoản thành công (`POST /auth/signup`) -> HTTP 201 Created
-- **Lệnh gửi (Request)**:
+### 1. Đăng ký tài khoản thành công (`POST /auth/signup`) -> HTTP 201
+```http
+HTTP/1.1 201 Created
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 70
+ETag: W/"46-chWWUXLnxcv1YS5A4SYIFRVw3eU"
+Date: Thu, 04 Jun 2026 02:20:53 GMT
+Connection: keep-alive
+
+{"id":"486a206b-5ca6-4e2d-a2bd-85b9f0ee41d2","email":"alice@demo.com"}
+```
+
+### 2. Signin lần 1 và lấy tokenA (`POST /auth/signin`) -> HTTP 200
+```http
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 268
+Date: Thu, 04 Jun 2026 02:34:07 GMT
+Connection: keep-alive
+
+{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0ODZhMjA2Yi01Y2E2LTRlMmQtYTJiZC04NWI5ZjBlZTQxZDIiLCJqdGkiOiJmOTc3MTQ1NC1hZmYyLTQ5N2MtYmQwMC02YzMzNWViZTk0YjYiLCJpYXQiOjE3ODA1NDA5NTAsImV4cCI6MTc4MDU0MTg1MH0.ikg5yp3fxP-CqE-r5zGdHcKslJ72FzzRxV6NhkCAETo"}
+```
+
+### 3. Signin lần 2 và lấy tokenB với jti khác (`POST /auth/signin`) -> HTTP 200
+```http
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 268
+Date: Thu, 04 Jun 2026 02:34:07 GMT
+Connection: keep-alive
+
+{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0ODZhMjA2Yi01Y2E2LTRlMmQtYTJiZC04NWI5ZjBlZTQxZDIiLCJqdGkiOiJmZDU4ZjQzNi1iMzQ3LTRkMzEtYTNlZS0xYmU1MzNlNmEyYTgiLCJpYXQiOjE3ODA1NDA5NTAsImV4cCI6MTc4MDU0MTg1MH0.O0vz-YkkhtHu3jVu4HlzZ0SEVDT44nUmg2pqbf0erdQ"}
+```
+
+### 4. Logout với tokenA (`POST /auth/logout`) -> HTTP 204 No Content
+```http
+HTTP/1.1 204 No Content
+X-Powered-By: Express
+Date: Thu, 04 Jun 2026 02:34:07 GMT
+Connection: keep-alive
+```
+
+### 5. Kiểm tra Redis lưu trữ thông tin blacklist
+* **Lấy danh sách keys**:
   ```bash
-  curl.exe -i -X POST http://localhost:3000/auth/signup -H "Content-Type: application/json" -d "{\"email\":\"alice@demo.com\",\"password\":\"secret123\"}"
+  docker exec -t employee-auth-redis redis-cli --raw KEYS "blacklist:*"
   ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 201 Created
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 70
-  ETag: W/"46-chWWUXLnxcv1YS5A4SYIFRVw3eU"
-  Date: Wed, 03 Jun 2026 20:44:23 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"id":"15b30443-b26a-4411-9140-377188d12c34","email":"alice@demo.com"}
+  **Kết quả**:
+  ```text
+  blacklist:f9771454-aff2-497c-bd00-6c335ebe94b6
   ```
-
-### Case 2: Đăng ký thất bại do trùng lặp email (`POST /auth/signup`) -> HTTP 409 Conflict
-- **Lệnh gửi (Request)**:
+* **Lấy TTL của key**:
   ```bash
-  curl.exe -i -X POST http://localhost:3000/auth/signup -H "Content-Type: application/json" -d "{\"email\":\"alice@demo.com\",\"password\":\"secret123\"}"
+  docker exec -t employee-auth-redis redis-cli --raw TTL "blacklist:f9771454-aff2-497c-bd00-6c335ebe94b6"
   ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 409 Conflict
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 70
-  ETag: W/"46-Fqi7MW8UTTNsiOC7lI+OJ4Fodz4"
-  Date: Wed, 03 Jun 2026 20:46:23 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"message":"Email already in use","error":"Conflict","statusCode":409}
+  **Kết quả**:
+  ```text
+  899
   ```
 
-### Case 3: Đăng nhập thành công và lấy JWT (`POST /auth/signin`) -> HTTP 200 OK
-- **Lệnh gửi (Request)**:
+### 6. Gọi profile với tokenA đã logout -> HTTP 401 Unauthorized
+```http
+HTTP/1.1 401 Unauthorized
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 70
+Date: Thu, 04 Jun 2026 02:34:11 GMT
+Connection: keep-alive
+
+{"message":"Token revoked","error":"Unauthorized","statusCode":401}
+```
+
+### 7. Gọi profile với tokenB chưa logout -> HTTP 200 OK
+```http
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 120
+Date: Thu, 04 Jun 2026 02:34:11 GMT
+Connection: keep-alive
+
+{"message":"Bạn đã truy cập vào khu vực bảo mật!","user":{"userId":"486a206b-5ca6-4e2d-a2bd-85b9f0ee41d2"}}
+```
+
+### 8. Tự động dọn dẹp (Expired) sau khi hết hạn tự nhiên
+* Đặt `JWT_EXPIRATION=10s`, thực hiện đăng nhập rồi đăng xuất.
+* Tại thời điểm $t = 0s$:
   ```bash
-  curl.exe -i -X POST http://localhost:3000/auth/signin -H "Content-Type: application/json" -d "{\"email\":\"alice@demo.com\",\"password\":\"secret123\"}"
+  docker exec -t employee-auth-redis redis-cli --raw KEYS "blacklist:*"
   ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 200 OK
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 207
-  ETag: W/"cf-8FDnj6ZnY4uRYtTL9MNrzbLr1kE"
-  Date: Wed, 03 Jun 2026 20:44:50 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxNWIzMDQ0My1iMjZhLTQ0MTEtOTE0MC0zNzcxODhkMTJjMzQiLCJpYXQiOjE3ODA1MTk0OTAsImV4cCI6MTc4MDUyMDM5MH0.d_SU-lxV1THVjbA758PhJlbnP7vASStIeCVFftzlaoE"}
+  **Kết quả**:
+  ```text
+  blacklist:15861222-e6b1-44b6-a09b-ed364c62594c
   ```
-
-### Case 4: Đăng nhập thất bại do sai tài khoản / mật khẩu (`POST /auth/signin`) -> HTTP 401 Unauthorized
-- **Lệnh gửi (Request)**:
+* Sau khi chờ đợi $t = 11s$:
   ```bash
-  curl.exe -i -X POST http://localhost:3000/auth/signin -H "Content-Type: application/json" -d "{\"email\":\"alice@demo.com\",\"password\":\"wrongpassword\"}"
+  docker exec -t employee-auth-redis redis-cli --raw KEYS "blacklist:*"
   ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 401 Unauthorized
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 73
-  ETag: W/"49-Fx+yDPXfDSYD3nxIxyU6P47CVX0"
-  Date: Wed, 03 Jun 2026 20:46:35 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"message":"Invalid credentials","error":"Unauthorized","statusCode":401}
-  ```
-
-### Case 5: Truy cập hồ sơ có Token hợp lệ (`GET /employees/profile`) -> HTTP 200 OK
-- **Lệnh gửi (Request)**:
-  ```bash
-  curl.exe -i http://localhost:3000/employees/profile -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxNWIzMDQ0My1iMjZhLTQ0MTEtOTE0MC0zNzcxODhkMTJjMzQiLCJpYXQiOjE3ODA1MTk0OTAsImV4cCI6MTc4MDUyMDM5MH0.d_SU-lxV1THVjbA758PhJlbnP7vASStIeCVFftzlaoE"
-  ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 200 OK
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 120
-  ETag: W/"78-sDeozmru+wPGXl3uVyiUBkL7QDk"
-  Date: Wed, 03 Jun 2026 20:45:20 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"message":"Bạn đã truy cập vào khu vực bảo mật!","user":{"userId":"15b30443-b26a-4411-9140-377188d12c34"}}
-  ```
-
-### Case 6: Truy cập hồ sơ thiếu Token (`GET /employees/profile`) -> HTTP 401 Unauthorized
-- **Lệnh gửi (Request)**:
-  ```bash
-  curl.exe -i http://localhost:3000/employees/profile
-  ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 401 Unauthorized
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 43
-  ETag: W/"2b-dGnJzt6gv1nJjX6DJ9RztDWptng"
-  Date: Wed, 03 Jun 2026 20:45:43 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"message":"Unauthorized","statusCode":401}
-  ```
-
-### Case 7: Truy cập hồ sơ với Token có Signature sai (`GET /employees/profile`) -> HTTP 401 Unauthorized
-- **Lệnh gửi (Request - Thay đổi chữ cái cuối cùng từ eE sang eF)**:
-  ```bash
-  curl.exe -i http://localhost:3000/employees/profile -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxNWIzMDQ0My1iMjZhLTQ0MTEtOTE0MC0zNzcxODhkMTJjMzQiLCJpYXQiOjE3ODA1MTk0OTAsImV4cCI6MTc4MDUyMDM5MH0.d_SU-lxV1THVjbA758PhJlbnP7vASStIeCVFftzlaoF"
-  ```
-- **Phản hồi nhận về (Response)**:
-  ```http
-  HTTP/1.1 401 Unauthorized
-  X-Powered-By: Express
-  Content-Type: application/json; charset=utf-8
-  Content-Length: 43
-  ETag: W/"2b-dGnJzt6gv1nJjX6DJ9RztDWptng"
-  Date: Wed, 03 Jun 2026 20:46:07 GMT
-  Connection: keep-alive
-  Keep-Alive: timeout=5
-
-  {"message":"Unauthorized","statusCode":401}
+  **Kết quả**:
+  ```text
+  (empty)
   ```
 
 ---
 
-## 5. Code Execution Trace (Luồng xử lý `GET /employees/profile`)
+## 5. Code Execution Trace (Luồng xử lý `POST /auth/logout`)
 
-Quy trình xác thực yêu cầu hồ sơ của nhân viên đi qua 3 điểm chạm then chốt sau:
+Quy trình đăng xuất và thu hồi token đi qua các bước cụ thể như sau:
 
-1. **Điểm chạm 1 - Giao diện Endpoint bảo vệ**:
-   - **File & Dòng**: [src/modules/employee/employee.controller.ts:11](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/employee/employee.controller.ts#L11)
+1. **Điểm chạm 1 - Giao diện Endpoint của Controller**:
+   - **File & Dòng**: [src/modules/auth/auth.controller.ts:22](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.controller.ts#L22)
    - **Mã nguồn**:
      ```typescript
      @UseGuards(JwtAuthGuard)
-     @Get('profile')
-     async getProfile(@Request() req: any)
-     ```
-   - **Mô tả**: Khi request được gửi đến, NestJS chặn lại thông qua `@UseGuards(JwtAuthGuard)` để bắt đầu quy trình kiểm tra Token.
-
-2. **Điểm chạm 2 - Kích hoạt Guard xác thực JWT**:
-   - **File & Dòng**: [src/modules/auth/jwt-auth.guard.ts:4](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/jwt-auth.guard.ts#L4)
-   - **Mã nguồn**:
-     ```typescript
-     @Injectable()
-     export class JwtAuthGuard extends AuthGuard('jwt') {}
-     ```
-   - **Mô tả**: Lớp Guard kích hoạt cơ chế canActivate của Passport, bắt buộc trích xuất chuỗi Bearer token từ tiêu đề `Authorization` của HTTP Header.
-
-3. **Điểm chạm 3 - So khớp chữ ký và giải mã Claims**:
-   - **File & Dòng**: [src/modules/auth/jwt.strategy.ts:16](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/jwt.strategy.ts#L16)
-   - **Mã nguồn**:
-     ```typescript
-     async validate(payload: any) {
-       return { userId: payload.sub };
+     @HttpCode(HttpStatus.NO_CONTENT)
+     @Post('logout')
+     async logout(@Request() req: any) {
+       const token = req.headers.authorization?.split(' ')[1];
+       if (token) {
+         await this.authService.logout(token);
+       }
      }
      ```
-   - **Mô tả**: Sau khi giải mã thành công bằng thuật toán HS256 với secret key, JwtStrategy giải nén payload, lấy `sub` ánh xạ thành thuộc tính `userId` và gán lại cho Request tại `req.user.userId`. Sau đó cho phép chuyển tiếp request tới hàm `getProfile` của Controller.
+   - **Mô tả**: Khi người dùng gọi POST `/auth/logout`, JwtAuthGuard kiểm tra token có hợp lệ không. Nếu hợp lệ, controller trích xuất chuỗi Bearer token và chuyển giao cho `AuthService`.
+
+2. **Điểm chạm 2 - Tính toán TTL động và lưu Blacklist ở Service**:
+   - **File & Dòng**: [src/modules/auth/auth.service.ts:49](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L49)
+   - **Mã nguồn**:
+     ```typescript
+     async logout(token: string): Promise<void> {
+       try {
+         const decoded = this.jwtService.decode(token) as any;
+         if (decoded && decoded.jti && decoded.exp) {
+           const ttl = decoded.exp - Math.floor(Date.now() / 1000);
+           if (ttl > 0) {
+             await this.cacheManager.set(`blacklist:${decoded.jti}`, '1', ttl * 1000);
+           }
+         }
+       } catch (e) {
+         // Ignore
+       }
+     }
+     ```
+   - **Mô tả**: `AuthService` giải mã token mà không cần verify lại chữ ký để lấy claim `jti` và `exp`. Sau đó, lấy thời gian hiện tại để tính toán TTL động (bằng giây) và lưu vào Redis qua cacheManager dưới dạng mili-giây.
+
+3. **Điểm chạm 3 - Kết nối Redis lưu Key**:
+   - **File & Dòng**: [src/app.module.ts:38](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/app.module.ts#L38)
+   - **Mã nguồn**:
+     ```typescript
+     const keyvStore = {
+       get: (key: string) => (store as any).get(key),
+       set: (key: string, value: any, ttl?: number) => (store as any).set(key, value, ttl),
+       delete: (key: string) => (store as any).del(key).then(() => true),
+       clear: () => (store as any).reset(),
+     };
+     ```
+   - **Mô tả**: Lớp wrapper Keyv gọi trực tiếp adapter `cache-manager-ioredis-yet` để đẩy lệnh `SETEX blacklist:<jti> <ttl> 1` xuống Redis Database.
 
 ---
 
 ## 6. Design Decisions
 
-### A. Sử dụng database PostgreSQL 16 qua Docker Compose
-- **Quyết định**: Đóng gói môi trường cơ sở dữ liệu Postgres 16 nhằm đồng nhất cấu hình chạy ứng dụng ở mọi máy phát triển.
-- **Lý do**: Triển khai Postgres qua Docker tránh được việc xung đột dịch vụ Postgres cài đặt sẵn trên máy host, đồng thời giúp dễ dàng quản trị dữ liệu thông qua Volume Mount độc lập.
+### A. Lựa chọn cơ chế Blacklist dựa trên `jti` thay vì lưu giữ toàn bộ JWT String
+- **Quyết định**: Mỗi token được ký sẽ sinh ra một `jti` (UUID v4) duy nhất. Khi người dùng logout, chúng ta chỉ lưu giữ `blacklist:<jti>` vào Redis thay vì toàn bộ chuỗi token dài.
+- **Lý do**: Chuỗi token JWT thô có kích thước lớn (thường từ 200-500 bytes). Việc lưu toàn bộ chuỗi token thô vào Redis làm lãng phí dung lượng RAM. Lưu trữ `jti` (UUID v4 36 ký tự) giúp tối ưu hóa đáng kể bộ nhớ Redis khi quy mô người dùng tăng lên hàng triệu phiên làm việc.
 
-### B. Tắt tính năng tự động đồng bộ DB schema (`synchronize: false`)
-- **Quyết định**: Khóa tính năng tự động cập nhật bảng của TypeORM trên toàn bộ môi trường và bắt buộc tạo Schema qua tệp migration.
-- **Lý do**: Tính năng `synchronize: true` vô cùng nguy hiểm, có thể dẫn đến việc drop mất dữ liệu khi thay đổi code entity (VD: đổi tên cột). Dùng migration ghi lại lịch sử SQL vừa giúp quản trị cấu trúc vừa an toàn tuyệt đối cho môi trường Production.
+### B. Sử dụng Keyv làm Adapter tương thích cho CacheManager v3
+- **Quyết định**: Do NestJS v11 và `@nestjs/cache-manager` v3 chuyển dịch hoàn toàn sang Keyv và không còn tương thích trực tiếp với các adapter của `cache-manager` v5 (như `cache-manager-ioredis-yet`), chúng ta đã triển khai một Adapter Wrapper tối giản chuyển tiếp các cuộc gọi `.get`, `.set`, `.del`, `.reset` sang `.get`, `.set`, `.delete`, `.clear` của Keyv.
+- **Lý do**: Wrapper này giúp tận dụng tối đa sức mạnh kết nối của thư viện `ioredis` từ `cache-manager-ioredis-yet` mà không phải cài thêm hay cấu hình phức tạp các gói adapter Keyv ngoài luồng, đảm bảo tính ổn định và kiểm soát của dự án.
 
-### C. Triển khai Cơ chế Chống Dò Quét Tài Khoản (Anti-user Enumeration)
-- **Quyết định**: Khi đăng nhập thất bại, hệ thống phản hồi duy nhất một mã trạng thái 401 Unauthorized kèm theo nội dung `Invalid credentials` bất kể lỗi do sai mật khẩu hay email không tồn tại. Đồng thời, chạy dummy bcrypt so khớp nếu không tìm thấy user.
-- **Lý do**: Nếu phản hồi lỗi khác nhau (ví dụ: "Email không tồn tại" hoặc "Sai mật khẩu"), kẻ tấn công có thể viết script dò tìm danh sách tất cả các email đã đăng ký thành công trên hệ thống. Đồng nhất phản hồi và thời gian phản hồi giúp triệt tiêu hoàn toàn lỗ hổng bảo mật này.
-
-### D. Tách biệt `AuthModule` và `EmployeeModule`
-- **Quyết định**: Xây dựng hai module hoạt động hoàn toàn độc lập, chỉ liên kết qua Dependency Injection của NestJS.
-- **Lý do**: Tách biệt luồng xử lý giúp dễ dàng mở rộng và bảo trì. `AuthModule` đóng vai trò cổng bảo mật, trong khi `EmployeeModule` chứa các logic nghiệp vụ lõi về nhân viên.
+### C. Đánh đổi (Trade-off) giữa Stateless JWT vs. Revocation Blacklist
+- **Quyết định**: Kết hợp JWT không trạng thái truyền thống với một lớp kiểm tra blacklist nhanh (Fast Lookup) trên Redis.
+- **Lý do**:
+  - *Stateless JWT*: Có ưu thế là không cần truy vấn DB để lấy thông tin nhân viên trên mỗi request, giảm tải cho Postgres. Tuy nhiên, điểm yếu chết người là không thể hủy bỏ token từ phía máy chủ trước khi nó hết hạn.
+  - *Redis Blacklist*: Giải quyết triệt để vấn đề thu hồi token khi người dùng bấm đăng xuất. Việc kiểm tra blacklist chỉ tốn khoảng 1ms truy vấn bộ nhớ đệm (RAM) của Redis, một chi phí chấp nhận được để mang lại sự an toàn và kiểm soát tuyệt đối trên hệ thống.

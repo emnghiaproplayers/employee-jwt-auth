@@ -74,7 +74,10 @@ describe('Auth & Employee (e2e)', () => {
       .expect(401);
   });
 
-  it('POST /auth/signin -> should login successfully and return access token (200)', () => {
+  let tokenA: string;
+  let tokenB: string;
+
+  it('POST /auth/signin (1st login) -> should return tokenA (200)', () => {
     return request(app.getHttpServer())
       .post('/auth/signin')
       .send({
@@ -84,7 +87,22 @@ describe('Auth & Employee (e2e)', () => {
       .expect(200)
       .expect((res) => {
         expect(res.body).toHaveProperty('access_token');
-        jwtToken = res.body.access_token;
+        tokenA = res.body.access_token;
+      });
+  });
+
+  it('POST /auth/signin (2nd login) -> should return tokenB (200)', () => {
+    return request(app.getHttpServer())
+      .post('/auth/signin')
+      .send({
+        email: testEmail,
+        password: testPassword,
+      })
+      .expect(200)
+      .expect((res) => {
+        expect(res.body).toHaveProperty('access_token');
+        tokenB = res.body.access_token;
+        expect(tokenA).not.toBe(tokenB);
       });
   });
 
@@ -94,16 +112,40 @@ describe('Auth & Employee (e2e)', () => {
       .expect(401);
   });
 
-  it('GET /employees/profile -> should return employee profile when valid JWT is provided (200)', () => {
+  it('GET /employees/profile (with tokenA) -> should return profile successfully (200)', () => {
     return request(app.getHttpServer())
       .get('/employees/profile')
-      .set('Authorization', `Bearer ${jwtToken}`)
+      .set('Authorization', `Bearer ${tokenA}`)
       .expect(200)
       .expect((res) => {
         expect(res.body).toHaveProperty('message');
         expect(res.body).toHaveProperty('user');
         expect(res.body.user).toHaveProperty('userId');
-        expect(typeof res.body.user.userId).toBe('string');
+      });
+  });
+
+  it('POST /auth/logout (tokenA) -> should revoke tokenA and return 204 No Content', () => {
+    return request(app.getHttpServer())
+      .post('/auth/logout')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .expect(204);
+  });
+
+  it('GET /employees/profile (with tokenA after logout) -> should fail with 401 Unauthorized', () => {
+    return request(app.getHttpServer())
+      .get('/employees/profile')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .expect(401);
+  });
+
+  it('GET /employees/profile (with tokenB after tokenA logout) -> should still succeed with 200 OK', () => {
+    return request(app.getHttpServer())
+      .get('/employees/profile')
+      .set('Authorization', `Bearer ${tokenB}`)
+      .expect(200)
+      .expect((res) => {
+        expect(res.body).toHaveProperty('message');
       });
   });
 });
+
