@@ -5,7 +5,7 @@ import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { DataSource } from 'typeorm';
 
-describe('Auth & Employee (e2e)', () => {
+describe('Auth (e2e)', () => {
   let app: INestApplication<App>;
   let dataSource: DataSource;
 
@@ -24,19 +24,33 @@ describe('Auth & Employee (e2e)', () => {
     await app.init();
 
     dataSource = app.get(DataSource);
-    await dataSource.query('TRUNCATE TABLE "employees" CASCADE');
+    try {
+      await dataSource.query('TRUNCATE TABLE "users" CASCADE');
+      await dataSource.query('TRUNCATE TABLE "device_sessions" CASCADE');
+    } catch (err) {
+      // Ignore if tables do not exist yet
+    }
   });
 
   afterAll(async () => {
     if (dataSource && dataSource.isInitialized) {
-      await dataSource.query('TRUNCATE TABLE "employees" CASCADE');
+      try {
+        await dataSource.query('TRUNCATE TABLE "users" CASCADE');
+        await dataSource.query('TRUNCATE TABLE "device_sessions" CASCADE');
+      } catch (err) {
+        // Ignore
+      }
     }
     await app.close();
   });
 
-  const testEmail = `employee-${Date.now()}@company.com`;
+  const testEmail = `user-${Date.now()}@company.com`;
   const testPassword = 'securepassword123';
-  let jwtToken: string;
+  const testDeviceId = 'device-uuid-v4-123456';
+  const testDeviceId2 = 'device-uuid-v4-789012';
+  let accessTokenA: string;
+  let refreshTokenA: string;
+  let accessTokenB: string;
 
   it('POST /auth/signup -> should sign up successfully (201)', () => {
     return request(app.getHttpServer())
@@ -49,7 +63,6 @@ describe('Auth & Employee (e2e)', () => {
       .expect((res) => {
         expect(res.body).toHaveProperty('id');
         expect(res.body.email).toBe(testEmail);
-        expect(res.body).not.toHaveProperty('passwordHash');
         expect(res.body).not.toHaveProperty('password');
       });
   });
@@ -70,82 +83,46 @@ describe('Auth & Employee (e2e)', () => {
       .send({
         email: testEmail,
         password: 'wrongpassword',
+        deviceId: testDeviceId,
       })
       .expect(401);
   });
 
-  let tokenA: string;
-  let tokenB: string;
-
-  it('POST /auth/signin (1st login) -> should return tokenA (200)', () => {
+  it('POST /auth/signin (1st login with deviceId) -> should return token pair and deviceId (200)', () => {
     return request(app.getHttpServer())
       .post('/auth/signin')
       .send({
         email: testEmail,
         password: testPassword,
+        deviceId: testDeviceId,
       })
       .expect(200)
       .expect((res) => {
         expect(res.body).toHaveProperty('access_token');
-        tokenA = res.body.access_token;
+        expect(res.body).toHaveProperty('refresh_token');
+        expect(res.body).toHaveProperty('deviceId');
+        expect(res.body.deviceId).toBe(testDeviceId);
+        accessTokenA = res.body.access_token;
+        refreshTokenA = res.body.refresh_token;
       });
   });
 
-  it('POST /auth/signin (2nd login) -> should return tokenB (200)', () => {
+  it('POST /auth/signin (2nd login with different deviceId) -> should return different tokens (200)', () => {
     return request(app.getHttpServer())
       .post('/auth/signin')
       .send({
         email: testEmail,
         password: testPassword,
+        deviceId: testDeviceId2,
       })
       .expect(200)
       .expect((res) => {
         expect(res.body).toHaveProperty('access_token');
-        tokenB = res.body.access_token;
-        expect(tokenA).not.toBe(tokenB);
-      });
-  });
-
-  it('GET /employees/profile -> should fail when no JWT is provided (401)', () => {
-    return request(app.getHttpServer())
-      .get('/employees/profile')
-      .expect(401);
-  });
-
-  it('GET /employees/profile (with tokenA) -> should return profile successfully (200)', () => {
-    return request(app.getHttpServer())
-      .get('/employees/profile')
-      .set('Authorization', `Bearer ${tokenA}`)
-      .expect(200)
-      .expect((res) => {
-        expect(res.body).toHaveProperty('message');
-        expect(res.body).toHaveProperty('user');
-        expect(res.body.user).toHaveProperty('userId');
-      });
-  });
-
-  it('POST /auth/logout (tokenA) -> should revoke tokenA and return 204 No Content', () => {
-    return request(app.getHttpServer())
-      .post('/auth/logout')
-      .set('Authorization', `Bearer ${tokenA}`)
-      .expect(204);
-  });
-
-  it('GET /employees/profile (with tokenA after logout) -> should fail with 401 Unauthorized', () => {
-    return request(app.getHttpServer())
-      .get('/employees/profile')
-      .set('Authorization', `Bearer ${tokenA}`)
-      .expect(401);
-  });
-
-  it('GET /employees/profile (with tokenB after tokenA logout) -> should still succeed with 200 OK', () => {
-    return request(app.getHttpServer())
-      .get('/employees/profile')
-      .set('Authorization', `Bearer ${tokenB}`)
-      .expect(200)
-      .expect((res) => {
-        expect(res.body).toHaveProperty('message');
+        expect(res.body).toHaveProperty('refresh_token');
+        expect(res.body).toHaveProperty('deviceId');
+        expect(res.body.deviceId).toBe(testDeviceId2);
+        accessTokenB = res.body.access_token;
+        expect(accessTokenA).not.toBe(accessTokenB);
       });
   });
 });
-

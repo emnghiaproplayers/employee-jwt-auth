@@ -2,15 +2,19 @@ import { Module } from '@nestjs/common';
 import { PassportModule } from '@nestjs/passport';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { EmployeeModule } from '../employee/employee.module';
+// import { EmployeeModule } from '../employee/employee.module';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './jwt.strategy';
 import { JwtAuthGuard } from './jwt-auth.guard';
+import { RefreshTokenStrategy } from './refresh-token.strategy';
+import { User } from '../user/user.entity';
+import { DeviceSession } from './device-session.entity';
+import { TypeOrmModule } from '@nestjs/typeorm';
 
 @Module({
   imports: [
-    EmployeeModule,
+    // EmployeeModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
       imports: [ConfigModule],
@@ -22,9 +26,10 @@ import { JwtAuthGuard } from './jwt-auth.guard';
         },
       }),
     }),
+    TypeOrmModule.forFeature([User, DeviceSession])
   ],
-  providers: [AuthService, JwtStrategy, JwtAuthGuard],
+  providers: [AuthService, JwtStrategy, JwtAuthGuard, RefreshTokenStrategy],
   controllers: [AuthController],
   exports: [JwtAuthGuard, JwtModule, PassportModule],
 })
-export class AuthModule {}
+export class AuthModule { }
