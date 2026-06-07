@@ -1,285 +1,113 @@
-# NestJS Employee JWT Authentication & Redis Blacklisting
+# NestJS Employee JWT Authentication, Multi-Device Sessions & Refresh Token Rotation
 
-Hệ thống quản lý thông tin nhân viên (Employee) kết hợp cơ chế đăng ký/đăng nhập, xác thực không trạng thái (stateless) bằng JSON Web Token (JWT) theo thuật toán HS256 và cơ chế thu hồi phiên làm việc (revocation/logout) thời gian thực sử dụng Redis Blacklist. Dịch vụ chạy trên nền tảng NestJS, Passport, TypeORM, PostgreSQL 16 và Redis 7 thông qua Docker Compose.
+Hệ thống quản lý xác thực người dùng sử dụng JSON Web Token (JWT) với mô hình **Multi-Device Sessions** (Một User đăng nhập được trên nhiều thiết bị song song). Hệ thống tích hợp cơ chế **Refresh Token Rotation (Xoay vòng)** và **Logout theo từng thiết bị** độc lập mà không ảnh hưởng đến phiên làm việc trên các thiết bị khác của cùng một người dùng.
 
----
-
-## 1. Challenge Description
-
-Bài toán tập trung xây dựng quy trình xác thực người dùng an sau và cơ chế thu hồi JWT linh hoạt:
-- **Độc lập hóa Module**: Tách biệt `AuthModule` (signup/signin/strategy/guard) khỏi `EmployeeModule` (tài nguyên nghiệp vụ).
-- **PostgreSQL & Redis qua Docker**: Dựng cơ sở dữ liệu Postgres 16 và Redis 7 Alpine qua Docker Compose.
-- **Tắt đồng bộ hóa Schema tự động (`synchronize: false`)**: Dùng TypeORM CLI để tạo và chạy database migrations.
-- **Mã hóa và chống Enumeration**: Mã hóa mật khẩu bằng `bcrypt` (10 salt rounds), đồng nhất phản hồi lỗi đăng nhập 401 để chống User Enumeration.
-- **Unique Token Identifier (jti claim)**: Thêm claim `jti` (UUID v4) vào mỗi JWT token lúc đăng nhập để làm định danh duy nhất phục vụ thu hồi token.
-- **Cơ chế thu hồi phiên làm việc (Logout)**:
-  - Cho phép người dùng logout, trích xuất token hiện tại và giải mã để lấy `jti` và `exp`.
-  - Tính TTL động: `ttl = exp - hiện tại`.
-  - Lưu cặp `blacklist:<jti>` vào Redis với TTL động để tự động giải phóng bộ nhớ khi token hết hạn tự nhiên.
-- **Can thiệp JwtStrategy**: Tích hợp kiểm tra blacklist trực tiếp trong `JwtStrategy` sau khi verify chữ ký thành công.
+Dịch vụ chạy trên nền tảng NestJS, Passport, TypeORM, PostgreSQL 16 và Redis 7 thông qua Docker Compose.
 
 ---
 
-## 2. How to Run
+## 1. Schema & Cấu trúc Database
 
-### A. Yêu cầu hệ thống
-- Docker và Docker Compose cài đặt sẵn.
-- Node.js >= 18.x và npm.
+Bảng `device_sessions` quản lý các phiên làm việc của từng thiết bị.
 
-### B. Khởi chạy ứng dụng
-1. **Khởi động database PostgreSQL 16 và Redis 7 Alpine**:
-   ```bash
-   docker compose up -d
-   ```
-2. **Chạy migrations tạo cấu trúc bảng `employees`**:
-   ```bash
-   npm run migration:run
-   ```
-3. **Khởi chạy máy chủ NestJS**:
-   ```bash
-   npm run start
-   ```
-
-### C. Chạy bộ kiểm thử tự động
-- **Chạy E2E Tests**:
-  ```bash
-  npm run test:e2e
-  ```
-- **Chạy Unit Tests**:
-  ```bash
-  npm run test
-  ```
+* **Thực thể (`DeviceSession` Entity):** [device-session.entity.ts](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/device-session.entity.ts)
+* **Các cột chính:**
+  * `id`: `uuid` (Primary Key).
+  * `userId`: `integer` (Foreign Key tham chiếu tới bảng `users`).
+  * `deviceId`: `varchar` (Mã định danh thiết bị độc lập do client tự sinh).
+  * `refreshTokenHash`: `text` (Mã băm bcrypt của Refresh Token hiện tại, giá trị là `null` nếu đã Logout).
+  * `createdAt` / `updatedAt`: `timestamp`.
+* **Ràng buộc duy nhất (Unique Constraint):** `@Unique(['userId', 'deviceId'])` đảm bảo mỗi cặp người dùng và thiết bị chỉ tồn tại duy nhất một phiên hoạt động tại bất kỳ thời điểm nào.
 
 ---
 
-## 3. Architecture & Stack
+## 2. Các luồng xử lý chính & Tracking Code
 
-Dự án được xây dựng dựa trên:
-- **NestJS v11.x**, **TypeScript v5.7**, **TypeORM**, **Postgres driver (`pg`)**.
-- **cache-manager-ioredis-yet & @nestjs/cache-manager**: Kết nối và quản trị bộ nhớ cache Redis.
-- **keyv**: Được NestJS CacheManager v3 sử dụng ngầm để định cấu hình lưu trữ phân tán.
+### A. Luồng Đăng nhập (`POST /auth/signin`)
+Client gửi lên request body gồm: `{ email, password, deviceId }`.
+1. **Xác thực thông tin tài khoản**: [auth.service.ts:L66-L77](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L66-L77) tìm User và đối sánh password qua bcrypt.
+2. **Ký phát Token**: 
+   * **Access Token** chứa payload `{ sub, email }`, hạn 15 phút, kèm unique `jwtid` (jti) ([L80-L87](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L80-L87)).
+   * **Refresh Token** chứa payload `{ sub, deviceId }`, hạn 7 ngày, kèm unique `jwtid` (jti) ([L90-L97](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L90-L97)).
+3. **Mã hóa và Upsert**: Băm Refresh Token mới ([L99](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L99)) và gọi `deviceSessionRepository.upsert` để lưu vào DB theo cặp khóa `['userId', 'deviceId']` ([L102-L110](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L102-L110)).
 
-### Sơ đồ Mermaid luồng Revocation & Blacklisting
+---
+
+### B. Luồng Làm mới Token (`POST /auth/refresh`)
+Client gửi Bearer Refresh Token ở Header (`Authorization: Bearer <token>`).
+1. **Verify Signature**: [refresh-token.strategy.ts:L22-L27](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/refresh-token.strategy.ts#L22-L27) tự động verify chữ ký số và hạn dùng dựa trên `JWT_REFRESH_SECRET`.
+2. **Blacklist Check**: [refresh-token.strategy.ts:L39-L44](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/refresh-token.strategy.ts#L39-L44) kiểm tra xem token JTI có nằm trong Redis blacklist không.
+3. **Đối chiếu DB & Phân loại mã lỗi**:
+   * **Lỗi 401 Unauthorized (Đã bị thu hồi / Logout)**: Nếu `refreshTokenHash` trong DB của session này đang là `null` ([refresh-token.strategy.ts:L51-L54](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/refresh-token.strategy.ts#L51-L54)).
+   * **Lỗi 403 Forbidden (Phát hiện Replay Attack / Reuse)**: Nếu hash tồn tại nhưng so sánh bcrypt không khớp ([refresh-token.strategy.ts:L56-L66](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/refresh-token.strategy.ts#L56-L66)). Đồng thời, hệ thống lập tức thu hồi toàn bộ session này (set `refreshTokenHash = null`) để tự động ngắt kết nối thiết bị đáng ngờ.
+4. **Rotation**: Nếu hợp lệ, hệ thống phát cặp token mới, cập nhật hash mới vào DB ([auth.service.ts:L163-L166](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L163-L166)) và đưa JTI của Refresh Token cũ vào Redis blacklist ([auth.service.ts:L169-L174](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L169-L174)).
+
+---
+
+### C. Luồng Đăng xuất thiết bị cụ thể (`POST /auth/logout`)
+Client gửi Bearer Access Token ở Header và request body `{ deviceId }`.
+1. **Trích xuất thông tin**: [auth.controller.ts:L31-L33](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.controller.ts#L31-L33) xác thực người dùng qua `JwtAuthGuard` và gọi hàm `logout`.
+2. **Hủy bỏ phiên độc lập**: [auth.service.ts:L186-L189](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L186-L189) cập nhật `refreshTokenHash = null` cho cặp `(userId, deviceId)`. 
+3. **Blacklist Access Token**: Đưa JTI của Access Token vừa đăng xuất vào Redis Blacklist với TTL động ([auth.service.ts:L192-L203](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L192-L203)).
+
+---
+
+## 3. Sơ đồ Mermaid luồng Multi-Device Refresh Token Rotation & Revocation
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client as Client / HTTP Request
-    participant Controller as AuthController (auth.controller.ts)
-    participant Service as AuthService (auth.service.ts)
-    participant Redis as Redis Cache Store
+    actor ClientA as Device A (client)
+    actor ClientB as Device B (client)
+    participant Auth as AuthController / Service
+    participant DB as Postgres (device_sessions)
+    participant Redis as Redis Blacklist
 
-    Note over Client, Redis: Phase 1: Đăng xuất & Thu hồi Token (SET)
-    Client->>Controller: POST /auth/logout (Authorization: Bearer <tokenA>)
-    activate Controller
-    Note over Controller: Xác thực JWT hợp lệ thành công qua Guard
-    Controller->>Service: logout(tokenA)
-    activate Service
-    Note over Service: Giải mã tokenA lấy jti & exp
-    Note over Service: Tính TTL = exp - hiện tại
-    Service->>Redis: SET blacklist:<jti> "1" EX <ttl>
-    activate Redis
-    Redis-->>Service: Đã lưu thành công
-    deactivate Redis
-    Service-->>Controller: Hoàn tất thu hồi
-    deactivate Service
-    Controller-->>Client: Trả về HTTP 204 No Content
-    deactivate Controller
+    Note over ClientA, DB: Đăng nhập song song trên 2 thiết bị
+    ClientA->>Auth: POST /auth/signin { email, password, deviceId: "deviceA" }
+    Auth->>DB: upsert({ userId: 1, deviceId: "deviceA", hashA })
+    Auth-->>ClientA: Trả về { access_token_A, refresh_token_A }
+    
+    ClientB->>Auth: POST /auth/signin { email, password, deviceId: "deviceB" }
+    Auth->>DB: upsert({ userId: 1, deviceId: "deviceB", hashB })
+    Auth-->>ClientB: Trả về { access_token_B, refresh_token_B }
 
-    Note over Client, Redis: Phase 2: Xác thực & Đối chiếu Blacklist (GET)
-    Client->>Controller: GET /employees/profile (Authorization: Bearer <tokenA>)
-    activate Controller
-    Note over Controller: Kích hoạt Guard -> JwtStrategy
-    Note over Controller: Giải mã chữ ký tokenA và lấy jti từ payload
-    Controller->>Redis: GET blacklist:<jti>
-    activate Redis
-    Redis-->>Controller: Trả về "1" (Token đã bị thu hồi)
-    deactivate Redis
-    Controller-->>Client: Trả về HTTP 401 Unauthorized (Token revoked)
-    deactivate Controller
+    Note over ClientA, Redis: Làm mới Token (Rotation) của Device A
+    ClientA->>Auth: POST /auth/refresh (Bearer refresh_token_A)
+    Auth->>Redis: GET blacklist:<jti_A> (Không có)
+    Auth->>DB: lookup(userId: 1, deviceId: "deviceA") -> Lấy hashA
+    Note over Auth: bcrypt.compare(refresh_token_A, hashA) OK!
+    Auth->>DB: update({ deviceId: "deviceA" }, { refreshTokenHash: hashNewA })
+    Auth->>Redis: SET blacklist:<jti_A> EX <ttl>
+    Auth-->>ClientA: Trả về { access_token_newA, refresh_token_newA }
+
+    Note over ClientA, DB: Phát hiện Replay Attack (ClientA gửi lại refresh_token_A cũ)
+    ClientA->>Auth: POST /auth/refresh (Bearer refresh_token_A)
+    Auth->>Redis: GET blacklist:<jti_A> -> Trả về "1"
+    Note over Auth: Phát hiện Token bị thu hồi / Reused!
+    Auth->>DB: update({ deviceId: "deviceA" }, { refreshTokenHash: null })
+    Auth-->>ClientA: Trả về HTTP 403 Forbidden (Reuse detected)
+
+    Note over ClientB, DB: Device B vẫn hoạt động bình thường
+    ClientB->>Auth: POST /auth/refresh (Bearer refresh_token_B)
+    Note over Auth: So khớp hashB thành công!
+    Auth-->>ClientB: Trả về { access_token_newB, refresh_token_newB }
 ```
 
 ---
 
-## 4. Smoke Test (Bằng chứng Thực tế)
+## 4. Cách chạy và Test cơ chế này
 
-Dưới đây là các phản hồi thực tế được thực hiện trực tiếp từ dòng lệnh sử dụng `curl.exe` và `redis-cli` trong môi trường Docker:
-
-### 1. Đăng ký tài khoản thành công (`POST /auth/signup`) -> HTTP 201
-```http
-HTTP/1.1 201 Created
-X-Powered-By: Express
-Content-Type: application/json; charset=utf-8
-Content-Length: 70
-ETag: W/"46-chWWUXLnxcv1YS5A4SYIFRVw3eU"
-Date: Thu, 04 Jun 2026 02:20:53 GMT
-Connection: keep-alive
-
-{"id":"486a206b-5ca6-4e2d-a2bd-85b9f0ee41d2","email":"alice@demo.com"}
-```
-
-### 2. Signin lần 1 và lấy tokenA (`POST /auth/signin`) -> HTTP 200
-```http
-HTTP/1.1 200 OK
-X-Powered-By: Express
-Content-Type: application/json; charset=utf-8
-Content-Length: 268
-Date: Thu, 04 Jun 2026 02:34:07 GMT
-Connection: keep-alive
-
-{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0ODZhMjA2Yi01Y2E2LTRlMmQtYTJiZC04NWI5ZjBlZTQxZDIiLCJqdGkiOiJmOTc3MTQ1NC1hZmYyLTQ5N2MtYmQwMC02YzMzNWViZTk0YjYiLCJpYXQiOjE3ODA1NDA5NTAsImV4cCI6MTc4MDU0MTg1MH0.ikg5yp3fxP-CqE-r5zGdHcKslJ72FzzRxV6NhkCAETo"}
-```
-
-### 3. Signin lần 2 và lấy tokenB với jti khác (`POST /auth/signin`) -> HTTP 200
-```http
-HTTP/1.1 200 OK
-X-Powered-By: Express
-Content-Type: application/json; charset=utf-8
-Content-Length: 268
-Date: Thu, 04 Jun 2026 02:34:07 GMT
-Connection: keep-alive
-
-{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0ODZhMjA2Yi01Y2E2LTRlMmQtYTJiZC04NWI5ZjBlZTQxZDIiLCJqdGkiOiJmZDU4ZjQzNi1iMzQ3LTRkMzEtYTNlZS0xYmU1MzNlNmEyYTgiLCJpYXQiOjE3ODA1NDA5NTAsImV4cCI6MTc4MDU0MTg1MH0.O0vz-YkkhtHu3jVu4HlzZ0SEVDT44nUmg2pqbf0erdQ"}
-```
-
-### 4. Logout với tokenA (`POST /auth/logout`) -> HTTP 204 No Content
-```http
-HTTP/1.1 204 No Content
-X-Powered-By: Express
-Date: Thu, 04 Jun 2026 02:34:07 GMT
-Connection: keep-alive
-```
-
-### 5. Kiểm tra Redis lưu trữ thông tin blacklist
-* **Lấy danh sách keys**:
-  ```bash
-  docker exec -t employee-auth-redis redis-cli --raw KEYS "blacklist:*"
-  ```
-  **Kết quả**:
-  ```text
-  blacklist:f9771454-aff2-497c-bd00-6c335ebe94b6
-  ```
-* **Lấy TTL của key**:
-  ```bash
-  docker exec -t employee-auth-redis redis-cli --raw TTL "blacklist:f9771454-aff2-497c-bd00-6c335ebe94b6"
-  ```
-  **Kết quả**:
-  ```text
-  899
-  ```
-
-### 6. Gọi profile với tokenA đã logout -> HTTP 401 Unauthorized
-```http
-HTTP/1.1 401 Unauthorized
-X-Powered-By: Express
-Content-Type: application/json; charset=utf-8
-Content-Length: 70
-Date: Thu, 04 Jun 2026 02:34:11 GMT
-Connection: keep-alive
-
-{"message":"Token revoked","error":"Unauthorized","statusCode":401}
-```
-
-### 7. Gọi profile với tokenB chưa logout -> HTTP 200 OK
-```http
-HTTP/1.1 200 OK
-X-Powered-By: Express
-Content-Type: application/json; charset=utf-8
-Content-Length: 120
-Date: Thu, 04 Jun 2026 02:34:11 GMT
-Connection: keep-alive
-
-{"message":"Bạn đã truy cập vào khu vực bảo mật!","user":{"userId":"486a206b-5ca6-4e2d-a2bd-85b9f0ee41d2"}}
-```
-
-### 8. Tự động dọn dẹp (Expired) sau khi hết hạn tự nhiên
-* Đặt `JWT_EXPIRATION=10s`, thực hiện đăng nhập rồi đăng xuất.
-* Tại thời điểm $t = 0s$:
-  ```bash
-  docker exec -t employee-auth-redis redis-cli --raw KEYS "blacklist:*"
-  ```
-  **Kết quả**:
-  ```text
-  blacklist:15861222-e6b1-44b6-a09b-ed364c62594c
-  ```
-* Sau khi chờ đợi $t = 11s$:
-  ```bash
-  docker exec -t employee-auth-redis redis-cli --raw KEYS "blacklist:*"
-  ```
-  **Kết quả**:
-  ```text
-  (empty)
-  ```
-
----
-
-## 5. Code Execution Trace (Luồng xử lý `POST /auth/logout`)
-
-Quy trình đăng xuất và thu hồi token đi qua các bước cụ thể như sau:
-
-1. **Điểm chạm 1 - Giao diện Endpoint của Controller**:
-   - **File & Dòng**: [src/modules/auth/auth.controller.ts:22](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.controller.ts#L22)
-   - **Mã nguồn**:
-     ```typescript
-     @UseGuards(JwtAuthGuard)
-     @HttpCode(HttpStatus.NO_CONTENT)
-     @Post('logout')
-     async logout(@Request() req: any) {
-       const token = req.headers.authorization?.split(' ')[1];
-       if (token) {
-         await this.authService.logout(token);
-       }
-     }
-     ```
-   - **Mô tả**: Khi người dùng gọi POST `/auth/logout`, JwtAuthGuard kiểm tra token có hợp lệ không. Nếu hợp lệ, controller trích xuất chuỗi Bearer token và chuyển giao cho `AuthService`.
-
-2. **Điểm chạm 2 - Tính toán TTL động và lưu Blacklist ở Service**:
-   - **File & Dòng**: [src/modules/auth/auth.service.ts:49](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/modules/auth/auth.service.ts#L49)
-   - **Mã nguồn**:
-     ```typescript
-     async logout(token: string): Promise<void> {
-       try {
-         const decoded = this.jwtService.decode(token) as any;
-         if (decoded && decoded.jti && decoded.exp) {
-           const ttl = decoded.exp - Math.floor(Date.now() / 1000);
-           if (ttl > 0) {
-             await this.cacheManager.set(`blacklist:${decoded.jti}`, '1', ttl * 1000);
-           }
-         }
-       } catch (e) {
-         // Ignore
-       }
-     }
-     ```
-   - **Mô tả**: `AuthService` giải mã token mà không cần verify lại chữ ký để lấy claim `jti` và `exp`. Sau đó, lấy thời gian hiện tại để tính toán TTL động (bằng giây) và lưu vào Redis qua cacheManager dưới dạng mili-giây.
-
-3. **Điểm chạm 3 - Kết nối Redis lưu Key**:
-   - **File & Dòng**: [src/app.module.ts:38](file:///d:/Nghia-project/escape-beta/employee-jwt-auth/src/app.module.ts#L38)
-   - **Mã nguồn**:
-     ```typescript
-     const keyvStore = {
-       get: (key: string) => (store as any).get(key),
-       set: (key: string, value: any, ttl?: number) => (store as any).set(key, value, ttl),
-       delete: (key: string) => (store as any).del(key).then(() => true),
-       clear: () => (store as any).reset(),
-     };
-     ```
-   - **Mô tả**: Lớp wrapper Keyv gọi trực tiếp adapter `cache-manager-ioredis-yet` để đẩy lệnh `SETEX blacklist:<jti> <ttl> 1` xuống Redis Database.
-
----
-
-## 6. Design Decisions
-
-### A. Lựa chọn cơ chế Blacklist dựa trên `jti` thay vì lưu giữ toàn bộ JWT String
-- **Quyết định**: Mỗi token được ký sẽ sinh ra một `jti` (UUID v4) duy nhất. Khi người dùng logout, chúng ta chỉ lưu giữ `blacklist:<jti>` vào Redis thay vì toàn bộ chuỗi token dài.
-- **Lý do**: Chuỗi token JWT thô có kích thước lớn (thường từ 200-500 bytes). Việc lưu toàn bộ chuỗi token thô vào Redis làm lãng phí dung lượng RAM. Lưu trữ `jti` (UUID v4 36 ký tự) giúp tối ưu hóa đáng kể bộ nhớ Redis khi quy mô người dùng tăng lên hàng triệu phiên làm việc.
-
-### B. Sử dụng Keyv làm Adapter tương thích cho CacheManager v3
-- **Quyết định**: Do NestJS v11 và `@nestjs/cache-manager` v3 chuyển dịch hoàn toàn sang Keyv và không còn tương thích trực tiếp với các adapter của `cache-manager` v5 (như `cache-manager-ioredis-yet`), chúng ta đã triển khai một Adapter Wrapper tối giản chuyển tiếp các cuộc gọi `.get`, `.set`, `.del`, `.reset` sang `.get`, `.set`, `.delete`, `.clear` của Keyv.
-- **Lý do**: Wrapper này giúp tận dụng tối đa sức mạnh kết nối của thư viện `ioredis` từ `cache-manager-ioredis-yet` mà không phải cài thêm hay cấu hình phức tạp các gói adapter Keyv ngoài luồng, đảm bảo tính ổn định và kiểm soát của dự án.
-
-### C. Đánh đổi (Trade-off) giữa Stateless JWT vs. Revocation Blacklist
-- **Quyết định**: Kết hợp JWT không trạng thái truyền thống với một lớp kiểm tra blacklist nhanh (Fast Lookup) trên Redis.
-- **Lý do**:
-  - *Stateless JWT*: Có ưu thế là không cần truy vấn DB để lấy thông tin nhân viên trên mỗi request, giảm tải cho Postgres. Tuy nhiên, điểm yếu chết người là không thể hủy bỏ token từ phía máy chủ trước khi nó hết hạn.
-  - *Redis Blacklist*: Giải quyết triệt để vấn đề thu hồi token khi người dùng bấm đăng xuất. Việc kiểm tra blacklist chỉ tốn khoảng 1ms truy vấn bộ nhớ đệm (RAM) của Redis, một chi phí chấp nhận được để mang lại sự an toàn và kiểm soát tuyệt đối trên hệ thống.
+1. **Khởi động Containers (Postgres + Redis)**:
+   ```bash
+   docker compose up -d
+   ```
+2. **Biên dịch và chạy thử NestJS**:
+   ```bash
+   npm run start:dev
+   ```
+3. **Chạy các bài kiểm thử tích hợp (E2E Tests)**:
+   ```bash
+   npm run test:e2e
+   ```
+   Bộ test e2e trong `test/auth.e2e-spec.ts` sẽ giả lập đăng nhập đồng thời 2 thiết bị khác nhau, kiểm tra độc lập các token và đảm bảo rằng việc hủy phiên (logout) trên một thiết bị không làm ảnh hưởng hay ngắt quãng phiên đăng nhập của các thiết bị khác.

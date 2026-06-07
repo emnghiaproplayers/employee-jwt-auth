@@ -75,25 +75,29 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // const payload = { sub: employee.id, jti: randomUUID() };
+    // Phát Access Token với unique JWT ID (jti)
     const access_token = await this.jwtService.signAsync(
       { sub: user.id, email: user.email },
       {
         secret: this.configService.get<string>('JWT_ACCESS_SECRET') || this.configService.get<string>('JWT_SECRET') || 'access_secret',
         expiresIn: '15m',
+        jwtid: randomUUID(),
       },
     );
 
+    // Phát Refresh Token với unique JWT ID (jti)
     const refresh_token = await this.jwtService.signAsync(
       { sub: user.id, deviceId },
       {
         secret: this.configService.get<string>('JWT_REFRESH_SECRET') || 'refresh_secret',
         expiresIn: '7d',
+        jwtid: randomUUID(),
       },
     );
 
     const refreshTokenHash = await bcrypt.hash(refresh_token, 10);
 
+    // Lưu / cập nhật phiên đăng nhập của thiết bị vào DB
     await this.deviceSessionRepository.upsert(
       {
         userId: user.id,
@@ -111,36 +115,58 @@ export class AuthService {
   }
 
   async refreshTokens(userId: number, deviceId: string, refreshToken: string) {
-    // Lookup device_sessions by (userId, deviceId)
+    // 1. Giải mã token để lấy thông tin jti phục vụ đối chiếu blacklist
+    let decoded: any;
+    try {
+      decoded = this.jwtService.decode(refreshToken) as any;
+    } catch (err) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    // 2. Kiểm tra xem Refresh Token có nằm trong Cache Blacklist (Redis) hay không
+    if (decoded && decoded.jti) {
+      const isBlacklisted = await this.cacheManager.get(`blacklist:${decoded.jti}`);
+      if (isBlacklisted) {
+        throw new ForbiddenException('Refresh token reuse detected / blacklisted');
+      }
+    }
+
+    // 3. Tìm kiếm thông tin phiên làm việc trong DB theo (userId, deviceId)
     const session = await this.deviceSessionRepository.findOne({
       where: { userId, deviceId },
     });
 
-    // If session not found or refreshTokenHash is null -> 401 Unauthorized (Refresh revoked)
+    // Nếu không tìm thấy hoặc cột refreshTokenHash = null -> 401 Unauthorized (Phiên đã thu hồi/Logout)
     if (!session || !session.refreshTokenHash) {
       throw new UnauthorizedException('Refresh token has been revoked / logged out');
     }
 
-    // Compare input token with stored hash
+    // 4. So khớp Refresh Token với Hash lưu trong DB
     const isMatch = await bcrypt.compare(refreshToken, session.refreshTokenHash);
 
-    // If not matching -> 403 Forbidden (Replay attack / hash mismatch)
+    // Nếu không khớp -> 403 Forbidden (Nghi ngờ Reuse/Replay attack)
     if (!isMatch) {
+      // Khi phát hiện hành vi tái sử dụng token cũ, lập tức thu hồi phiên (set null) để bảo vệ hệ thống
+      await this.deviceSessionRepository.update(
+        { id: session.id },
+        { refreshTokenHash: null }
+      );
       throw new ForbiddenException('Refresh token reuse detected / compromised');
     }
 
-    // Find the user to get current email
+    // 5. Tìm user hiện tại để trích xuất email
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
 
-    // Generate new token pair
+    // 6. Phát cặp token mới
     const access_token = await this.jwtService.signAsync(
       { sub: user.id, email: user.email },
       {
         secret: this.configService.get<string>('JWT_ACCESS_SECRET') || this.configService.get<string>('JWT_SECRET') || 'access_secret',
         expiresIn: '15m',
+        jwtid: randomUUID(),
       },
     );
 
@@ -149,17 +175,26 @@ export class AuthService {
       {
         secret: this.configService.get<string>('JWT_REFRESH_SECRET') || 'refresh_secret',
         expiresIn: '7d',
+        jwtid: randomUUID(),
       },
     );
 
-    // Hash the new refresh token
+    // 7. Mã hóa Refresh Token mới
     const newHash = await bcrypt.hash(refresh_token, 10);
 
-    // Update session table (Rotation)
+    // 8. Cập nhật hash mới vào DB (Rotation)
     await this.deviceSessionRepository.update(
       { id: session.id },
       { refreshTokenHash: newHash }
     );
+
+    // 9. Blacklist JTI của Refresh Token cũ để không thể tái sử dụng
+    if (decoded && decoded.jti && decoded.exp) {
+      const ttl = decoded.exp - Math.floor(Date.now() / 1000);
+      if (ttl > 0) {
+        await this.cacheManager.set(`blacklist:${decoded.jti}`, '1', ttl * 1000);
+      }
+    }
 
     return {
       access_token,
@@ -168,23 +203,36 @@ export class AuthService {
     };
   }
 
-  async logout(userId: number, deviceId: string, token?: string): Promise<void> {
+  async logout(userId: number, deviceId: string, accessToken?: string): Promise<void> {
+    // 1. Kiểm tra database xem phiên (session) đã được thu hồi trước đó chưa
+    const session = await this.deviceSessionRepository.findOne({
+      where: { userId, deviceId },
+    });
+
+    if (!session || session.refreshTokenHash === null) {
+      // Phiên đã được thu hồi hoặc không tồn tại (tránh việc gọi ghi đè lại nếu đã đăng xuất)
+      return;
+    }
+
+    // 2. Thu hồi token bằng cách cập nhật refreshTokenHash thành null
     await this.deviceSessionRepository.update(
-      { userId, deviceId },
+      { id: session.id },
       { refreshTokenHash: null }
     );
 
-    if (token) {
+    // 3. Đưa Access Token JTI vào Blacklist Cache (Redis) để chặn sử dụng ngay lập tức
+    if (accessToken) {
       try {
-        const decoded = this.jwtService.decode(token) as any;
+        const decoded = this.jwtService.decode(accessToken) as any;
         if (decoded && decoded.jti && decoded.exp) {
           const ttl = decoded.exp - Math.floor(Date.now() / 1000);
           if (ttl > 0) {
+            // Lưu vào Redis blacklist với TTL động
             await this.cacheManager.set(`blacklist:${decoded.jti}`, '1', ttl * 1000);
           }
         }
       } catch (e) {
-        // Ignore
+        // Bỏ qua lỗi nếu giải mã hoặc ghi cache thất bại
       }
     }
   }

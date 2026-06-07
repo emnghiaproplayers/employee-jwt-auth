@@ -16,22 +16,22 @@ export class DeviceSession {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column()
+  @Column({ type: 'integer' })
   userId: number;
 
   @ManyToOne(() => User, { onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'userId' })
+  @JoinColumn({ name: 'userId', referencedColumnName: 'id' })
   user: User;
 
-  @Column()
+  @Column({ type: 'varchar' })
   deviceId: string;
 
   @Column({ type: 'text', nullable: true })
   refreshTokenHash: string | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: 'timestamp' })
   createdAt: Date;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: 'timestamp' })
   updatedAt: Date;
 }

@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, Inject } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ForbiddenException, Inject } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
@@ -40,28 +40,37 @@ export class RefreshTokenStrategy extends PassportStrategy(Strategy, 'jwt-refres
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    // Check if token is blacklisted
+    // 1. Kiểm tra xem Refresh Token có nằm trong Cache Blacklist (Redis) hay không
     if (decoded.jti) {
       const isBlacklisted = await this.cacheManager.get(`blacklist:${decoded.jti}`);
       if (isBlacklisted) {
-        throw new UnauthorizedException('Token revoked');
+        throw new ForbiddenException('Refresh token has been blacklisted');
       }
     }
 
-    // Verify the refresh token against the stored hash
+    // 2. Tìm kiếm thông tin phiên làm việc trong DB theo (userId, deviceId)
     const session = await this.deviceSessionRepository.findOne({
       where: { userId: decoded.sub, deviceId: decoded.deviceId },
     });
 
+    // Nếu không tìm thấy hoặc cột refreshTokenHash = null -> 401 Unauthorized (Phiên đã thu hồi/Logout)
     if (!session || !session.refreshTokenHash) {
-      throw new UnauthorizedException('No active session found');
+      throw new UnauthorizedException('No active session found / refresh token revoked');
     }
 
+    // 3. So khớp Refresh Token với Hash lưu trong DB
     const isMatch = await bcrypt.compare(refreshToken, session.refreshTokenHash);
+    
+    // Nếu không khớp -> 403 Forbidden (Nghi ngờ Reuse/Replay attack)
     if (!isMatch) {
-      throw new UnauthorizedException('Invalid refresh token');
+      // Khi phát hiện hành vi tái sử dụng token cũ, lập tức thu hồi phiên (set null) để bảo vệ hệ thống
+      await this.deviceSessionRepository.update(
+        { id: session.id },
+        { refreshTokenHash: null }
+      );
+      throw new ForbiddenException('Refresh token reuse detected / compromised');
     }
 
-    return { userId: decoded.sub, deviceId: decoded.deviceId };
+    return { userId: decoded.sub, deviceId: decoded.deviceId, refreshToken };
   }
 }
