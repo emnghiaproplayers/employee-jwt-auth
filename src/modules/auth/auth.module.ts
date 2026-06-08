@@ -22,14 +22,15 @@ import { TypeOrmModule } from '@nestjs/typeorm';
       useFactory: async (configService: ConfigService) => ({
         secret: configService.getOrThrow<string>('JWT_SECRET'),
         signOptions: {
-          expiresIn: (configService.get<string>('JWT_EXPIRATION') || '15m') as any,
+          expiresIn: (configService.get<string>('JWT_EXPIRATION') ||
+            '15m') as any,
         },
       }),
     }),
-    TypeOrmModule.forFeature([User, DeviceSession])
+    TypeOrmModule.forFeature([User, DeviceSession]),
   ],
   providers: [AuthService, JwtStrategy, JwtAuthGuard, RefreshTokenStrategy],
   controllers: [AuthController],
   exports: [JwtAuthGuard, JwtModule, PassportModule],
 })
-export class AuthModule { }
+export class AuthModule {}

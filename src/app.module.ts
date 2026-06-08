@@ -6,6 +6,7 @@ import { User } from './modules/user/user.entity';
 import { DeviceSession } from './modules/auth/device-session.entity';
 // import { EmployeeModule } from './modules/employee/employee.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { CinemaModule } from './modules/cinema/cinema.module';
 import { CacheModule } from '@nestjs/cache-manager';
 import { redisStore } from 'cache-manager-ioredis-yet';
 
@@ -23,7 +24,8 @@ import { redisStore } from 'cache-manager-ioredis-yet';
         port: parseInt(configService.get<string>('DB_PORT') || '5432', 10),
         username: configService.get<string>('DB_USERNAME') || 'postgres',
         password: configService.get<string>('DB_PASSWORD') || 'postgres',
-        database: configService.get<string>('DB_DATABASE') || 'refresh_token_db',
+        database:
+          configService.get<string>('DB_DATABASE') || 'refresh_token_db',
         entities: [User, DeviceSession],
         synchronize: true,
       }),
@@ -40,7 +42,7 @@ import { redisStore } from 'cache-manager-ioredis-yet';
     }),
     // EmployeeModule,
     AuthModule,
+    CinemaModule,
   ],
 })
 export class AppModule {}
-

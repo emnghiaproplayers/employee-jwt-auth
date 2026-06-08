@@ -125,4 +125,63 @@ describe('Auth (e2e)', () => {
         expect(accessTokenA).not.toBe(accessTokenB);
       });
   });
+
+  describe('Cinema RBAC (e2e)', () => {
+    const managerEmail = `manager-${Date.now()}@company.com`;
+    let accessTokenManager: string;
+
+    beforeAll(async () => {
+      // Create a manager
+      await request(app.getHttpServer())
+        .post('/auth/signup')
+        .send({
+          email: managerEmail,
+          password: testPassword,
+          role: 'manager',
+        })
+        .expect(201);
+
+      // Sign in manager
+      const res = await request(app.getHttpServer())
+        .post('/auth/signin')
+        .send({
+          email: managerEmail,
+          password: testPassword,
+          deviceId: 'device-manager-test',
+        })
+        .expect(200);
+      accessTokenManager = res.body.access_token;
+    });
+
+    it('GET /cinema/manager/reports -> should fail for STAFF (403)', () => {
+      return request(app.getHttpServer())
+        .get('/cinema/manager/reports')
+        .set('Authorization', `Bearer ${accessTokenA}`)
+        .expect(403)
+        .expect((res) => {
+          expect(res.body.message).toBe('Forbidden resource');
+        });
+    });
+
+    it('GET /cinema/manager/reports -> should succeed for MANAGER (200)', () => {
+      return request(app.getHttpServer())
+        .get('/cinema/manager/reports')
+        .set('Authorization', `Bearer ${accessTokenManager}`)
+        .expect(200)
+        .expect((res) => {
+          expect(res.body).toHaveProperty('revenue');
+          expect(res.body).toHaveProperty('period');
+        });
+    });
+
+    it('GET /cinema/public/showtimes -> should succeed without token (200)', () => {
+      return request(app.getHttpServer())
+        .get('/cinema/public/showtimes')
+        .expect(200)
+        .expect((res) => {
+          expect(Array.isArray(res.body)).toBe(true);
+          expect(res.body.length).toBeGreaterThan(0);
+        });
+    });
+  });
 });

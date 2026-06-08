@@ -40,7 +40,9 @@ describe('EmployeeService', () => {
 
       const result = await service.findOneByEmail(email);
 
-      expect(mockEmployeeRepository.findOne).toHaveBeenCalledWith({ where: { email } });
+      expect(mockEmployeeRepository.findOne).toHaveBeenCalledWith({
+        where: { email },
+      });
       expect(result).toEqual({ id: 'uuid', email });
     });
   });
